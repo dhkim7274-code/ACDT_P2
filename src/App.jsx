@@ -1,15 +1,32 @@
 import { useState, useEffect, useRef } from 'react';
+import { joinSession, updateStatus } from './firebase';
+import Dashboard from './Dashboard';
 
 const CONFIG = {
   INFERENCE_INTERVAL: 250, 
 };
 
 function App() {
+  // ---------------------------------------------------------
+  // 1. 상태 관리 (State Management)
+  // ---------------------------------------------------------
+  
+  // 로그인 & 교수님 모드 관련
+  const [user, setUser] = useState(null); 
+  const [isLoginModalOpen, setIsLoginModalOpen] = useState(false); 
+  const [isProfessor, setIsProfessor] = useState(false);
+  const [inputName, setInputName] = useState('');
+  const [inputId, setInputId] = useState('');
+  
+  // setInterval 내부 접근용 Ref
+  const userRef = useRef(null);
+  useEffect(() => { userRef.current = user; }, [user]);
+
+  // 기존 핵심 기능 State
   const [status, setStatus] = useState('Ready to Start! 🚀');
   const [trafficLight, setTrafficLight] = useState('OFF');
   const [debugInfo, setDebugInfo] = useState({ label: '-', score: 0, mouth: 'Closed' });
   
-  // UI용 State
   const [settings, setSettings] = useState({
       confidence: 50,      
       mouthOpen: 10,       
@@ -20,26 +37,25 @@ function App() {
   const [logs, setLogs] = useState([]);
   const [violationLogs, setViolationLogs] = useState([]);
   
-  // 패널 상태
+  // UI 패널 State
   const [showLogs, setShowLogs] = useState(true);
   const [showVisualizer, setShowVisualizer] = useState(true);
   const [logTab, setLogTab] = useState('LIVE');
 
-  // 기능 상태
+  // 기능 토글 State
   const [isDarkMode, setIsDarkMode] = useState(true); 
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isSoundOn, setIsSoundOn] = useState(true); 
-
-  // 리포트 관련 State 👇 [신규]
+  
+  // 리포트 관련 State
   const [showReport, setShowReport] = useState(false);
   const [reportData, setReportData] = useState(null);
   const [startTime, setStartTime] = useState(null);
 
-  // 소리 상태 Ref
+  // Ref 모음
   const isSoundOnRef = useRef(true);
   useEffect(() => { isSoundOnRef.current = isSoundOn; }, [isSoundOn]);
 
-  // Logic용 Ref
   const settingsRef = useRef({
       confidence: 0.50,
       mouthOpen: 0.01,
@@ -47,7 +63,6 @@ function App() {
       strictness: 3
   });
 
-  // 시각화용 데이터 Ref
   const visualizerDataRef = useRef({
       gap: 0,
       movement: 0,
@@ -69,55 +84,31 @@ function App() {
   const animationFrameId = useRef(null);
   const intervalId = useRef(null);
 
-  useEffect(() => {
-    if (isInitCalled.current) return;
-    isInitCalled.current = true;
+  // ---------------------------------------------------------
+  // 2. 핸들러 함수들 (Handlers)
+  // ---------------------------------------------------------
 
-    const loadModels = async () => {
-      try {
-        console.log("🚀 System Start: Loading...");
+  const handleLogin = (e) => {
+    e.preventDefault();
+    if (!inputName || !inputId) return alert("이름과 학번을 입력해주세요!");
+    const sessionKey = joinSession(inputName, inputId);
+    setUser({ name: inputName, id: inputId, key: sessionKey });
+    setIsLoginModalOpen(false); 
+  };
 
-        // 1. Audio Model
-        let retries = 0;
-        while (!window.EdgeImpulseClassifier && retries < 100) {
-            await new Promise(r => setTimeout(r, 100));
-            retries++;
-        }
-        if (!window.EdgeImpulseClassifier) throw new Error("Audio Model Timeout");
+  const handleLogout = () => {
+      setUser(null);
+      setInputName('');
+      setInputId('');
+  };
 
-        const classifier = new window.EdgeImpulseClassifier();
-        await classifier.init();
-        
-        const props = classifier.getProperties();
-        modelSettings.current = {
-            frequency: props.frequency,             
-            inputSize: props.input_features_count   
-        };
-        
-        classifierRef.current = classifier;
-        const audioModuleBackup = window.Module;
-        window.Module = undefined;
-
-        // 2. Vision Model
-        const { FilesetResolver, FaceLandmarker } = await import('@mediapipe/tasks-vision');
-        const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm");
-        landmarkerRef.current = await FaceLandmarker.createFromOptions(vision, {
-          baseOptions: { modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task` },
-          runningMode: "VIDEO",
-          numFaces: 1
-        });
-
-        window.Module = audioModuleBackup;
-        setStatus('Ready to Start! 🚀');
-
-      } catch (error) {
-        console.error("❌ Error:", error);
-        setStatus('Error: Check Console');
-      }
-    };
-
-    loadModels();
-  }, []);
+  const handleSettingChange = (key, value) => {
+      setSettings(prev => ({ ...prev, [key]: value }));
+      if (key === 'confidence') settingsRef.current.confidence = value / 100;
+      if (key === 'mouthOpen') settingsRef.current.mouthOpen = value / 1000; 
+      if (key === 'lipMovement') settingsRef.current.lipMovement = value / 10000; 
+      if (key === 'strictness') settingsRef.current.strictness = value;
+  };
 
   const playWarningSound = () => {
     if (!isSoundOnRef.current) return; 
@@ -149,7 +140,58 @@ function App() {
     }
   };
 
-  // 캔버스 그리기 (Ref로 제어)
+  // ---------------------------------------------------------
+  // 3. 로직 및 라이프사이클 (Logic & Effects)
+  // ---------------------------------------------------------
+
+  useEffect(() => {
+    if (isInitCalled.current) return;
+    isInitCalled.current = true;
+
+    const loadModels = async () => {
+      try {
+        console.log("🚀 System Start: Loading...");
+        let retries = 0;
+        while (!window.EdgeImpulseClassifier && retries < 100) {
+            await new Promise(r => setTimeout(r, 100));
+            retries++;
+        }
+        if (!window.EdgeImpulseClassifier) throw new Error("Audio Model Timeout");
+
+        const classifier = new window.EdgeImpulseClassifier();
+        await classifier.init();
+        
+        const props = classifier.getProperties();
+        modelSettings.current = {
+            frequency: props.frequency,             
+            inputSize: props.input_features_count   
+        };
+        
+        classifierRef.current = classifier;
+        const audioModuleBackup = window.Module;
+        window.Module = undefined;
+
+        const { FilesetResolver, FaceLandmarker } = await import('@mediapipe/tasks-vision');
+        const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm");
+        landmarkerRef.current = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: { modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task` },
+          runningMode: "VIDEO",
+          numFaces: 1
+        });
+
+        window.Module = audioModuleBackup;
+        setStatus('Ready to Start! 🚀');
+
+      } catch (error) {
+        console.error("❌ Error:", error);
+        setStatus('Error: Check Console');
+      }
+    };
+
+    loadModels();
+  }, []);
+
+  // 시각화 캔버스 그리기 루프
   useEffect(() => {
       const draw = () => {
           if (showVisualizer && canvasRef.current && videoRef.current && videoRef.current.readyState >= 2) {
@@ -184,15 +226,7 @@ function App() {
       return () => cancelAnimationFrame(animationFrameId.current);
   }, [showVisualizer]); 
 
-  // 설정 핸들러
-  const handleSettingChange = (key, value) => {
-      setSettings(prev => ({ ...prev, [key]: value }));
-      if (key === 'confidence') settingsRef.current.confidence = value / 100;
-      if (key === 'mouthOpen') settingsRef.current.mouthOpen = value / 1000; 
-      if (key === 'lipMovement') settingsRef.current.lipMovement = value / 10000; 
-      if (key === 'strictness') settingsRef.current.strictness = value;
-  };
-
+  // 계산 함수들
   const calculateStandardDeviation = (arr) => {
     if (arr.length === 0) return 0;
     const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
@@ -221,7 +255,6 @@ function App() {
     return result;
   };
 
-  // 👇 [신규] 시스템 종료 및 리포트 생성
   const stopSystem = () => {
       isRunning.current = false;
       setStatus('Stopped 🛑');
@@ -231,34 +264,24 @@ function App() {
       }
       clearInterval(intervalId.current);
 
-      // 통계 계산
+      // 통계 및 리포트 데이터 생성
       const endTime = Date.now();
       const duration = endTime - startTime;
-      
-      // 1. 총 적발 횟수
       const totalKills = violationLogs.length;
-
-      // 2. 평균 회복 시간 (적발 지속 시간의 평균)
-      // count 1 = 250ms. count 4 = 1000ms.
       const totalStack = violationLogs.reduce((acc, log) => acc + log.count, 0);
       const avgRecoveryMs = totalKills > 0 ? (totalStack * 250) / totalKills : 0;
 
-      // 3. 최장 생존 시간 (위반과 위반 사이의 최대 시간)
       let maxStreakMs = 0;
       if (totalKills === 0) {
           maxStreakMs = duration;
       } else {
-          // 시작 ~ 첫 위반
           let prevTime = startTime;
           const sortedLogs = [...violationLogs].sort((a, b) => a.id - b.id);
-          
           sortedLogs.forEach(log => {
               const diff = log.id - prevTime;
               if (diff > maxStreakMs) maxStreakMs = diff;
-              // 위반이 끝난 시간 (id는 감지 시작 시간이지만 간략화를 위해 id를 기준으로 함)
               prevTime = log.id + (log.count * 250); 
           });
-          // 마지막 위반 ~ 종료
           if (endTime - prevTime > maxStreakMs) maxStreakMs = endTime - prevTime;
       }
 
@@ -274,12 +297,10 @@ function App() {
       setShowReport(true);
   };
 
-  // 👇 [수정] Start/Stop 토글
   const toggleSystem = async () => {
       if (isRunning.current) {
           stopSystem();
       } else {
-          // Start
           try {
             setStatus('Starting Sensors...');
             const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
@@ -328,17 +349,13 @@ function App() {
                         const landmarks = result.faceLandmarks[0];
                         const upper = landmarks[13];
                         const lower = landmarks[14];
-                        
                         visualizerDataRef.current = { hasFace: true, upperLip: upper, lowerLip: lower, gap: 0, movement: 0 };
-                        
                         const gap = lower.y - upper.y;
                         visualizerDataRef.current.gap = gap;
-                        
                         lipDistanceHistory.current.push(gap);
                         if (lipDistanceHistory.current.length > 5) lipDistanceHistory.current.shift();
                         const movement = calculateStandardDeviation(lipDistanceHistory.current);
                         visualizerDataRef.current.movement = movement;
-
                         if (gap > mouthOpen) {
                             if (movement > lipMovement) { visualState = 'Speaking 🗣️'; isSpeakingVisual = true; }
                             else { visualState = 'Mouth Open 😮'; }
@@ -368,6 +385,11 @@ function App() {
                 }
 
                 if (isKoreanSuspected === 1) playWarningSound();
+
+                // 👇 파이어베이스 전송 (로그인 상태일 때만)
+                if (userRef.current) {
+                    updateStatus(userRef.current.key, isKoreanSuspected === 1, Math.round(audioConfidence * 100));
+                }
 
                 historyQueue.current.push(isKoreanSuspected);
                 if (historyQueue.current.length > 10) historyQueue.current.shift();
@@ -431,37 +453,23 @@ function App() {
       title: isDarkMode ? 'text-red-500' : 'text-red-600',
   };
 
-  // 👇 [신규] 위반 그래프 컴포넌트
+  // 그래프 컴포넌트
   const ViolationGraph = ({ vLogs, start, end, height = "h-16" }) => {
       const duration = end - start;
       if (duration <= 0) return null;
 
       return (
           <div className={`relative w-full ${height} bg-gray-900/50 rounded-lg overflow-hidden border border-gray-600 mt-2`}>
-              {/* 타임라인 가이드라인 */}
               <div className="absolute top-1/2 w-full h-px bg-gray-700"></div>
-              
               {vLogs.map((log) => {
-                  // 시작 시간으로부터의 위치 (%)
                   const left = ((log.id - start) / duration) * 100;
-                  // 스택에 따른 높이 (최소 20%, 최대 100%)
                   const barHeight = Math.min(100, 20 + (log.count * 5)); 
-                  // 스택에 따른 색상 강도 (투명도)
                   const opacity = Math.min(1, 0.5 + (log.count * 0.1));
+                  const isTall = barHeight > 80;
 
                   return (
-                      <div 
-                          key={log.id}
-                          className="absolute bottom-0 w-1 bg-red-500 hover:bg-red-400 hover:scale-150 transition-all cursor-pointer group"
-                          style={{ 
-                              left: `${left}%`, 
-                              height: `${barHeight}%`,
-                              opacity: opacity 
-                          }}
-                          title={`Time: ${log.time} | Score: ${log.score}% | Stack: x${log.count}`}
-                      >
-                          {/* 툴팁 (CSS Only) */}
-                          <div className="hidden group-hover:block absolute bottom-full left-1/2 -translate-x-1/2 mb-1 px-2 py-1 bg-black text-white text-[10px] rounded whitespace-nowrap z-50">
+                      <div key={log.id} className="absolute bottom-0 w-1 bg-red-500 hover:bg-red-400 hover:scale-150 transition-all cursor-pointer group" style={{ left: `${left}%`, height: `${barHeight}%`, opacity: opacity }}>
+                          <div className={`hidden group-hover:block absolute ${isTall ? 'top-2' : 'bottom-full mb-1'} left-1/2 -translate-x-1/2 px-2 py-1 bg-black text-white text-[10px] rounded whitespace-nowrap z-50 border border-gray-700 shadow-xl`}>
                               {log.time} (x{log.count})
                           </div>
                       </div>
@@ -471,7 +479,6 @@ function App() {
       );
   };
 
-  // 포맷팅 함수
   const formatDuration = (ms) => {
       const sec = Math.floor(ms / 1000);
       const min = Math.floor(sec / 60);
@@ -479,23 +486,49 @@ function App() {
       return `${h}h ${min % 60}m ${sec % 60}s`;
   };
 
+  // ---------------------------------------------------------
+  // 4. 화면 렌더링 (View)
+  // ---------------------------------------------------------
+
+  // 교수님 모드면 대시보드 렌더링
+  if (isProfessor) {
+      return <Dashboard onBack={() => setIsProfessor(false)} />;
+  }
+
+  // 일반 학생 화면
   return (
     <div className={`min-h-screen w-screen ${theme.bg} ${theme.text} flex flex-col md:flex-row p-4 gap-4 relative overflow-hidden justify-center items-center transition-colors duration-300`}>
       
-      {/* 컨트롤러 */}
-      <div className="absolute top-4 right-4 flex gap-2 z-50">
-          <button onClick={() => setIsSoundOn(!isSoundOn)} className={`p-2 rounded-lg border ${isSoundOn ? 'bg-green-600/20 border-green-500 text-green-500' : 'bg-gray-500/20 border-gray-500 text-gray-500'}`}>
-              {isSoundOn ? '🔊' : '🔇'}
-          </button>
-          <button onClick={() => setIsDarkMode(!isDarkMode)} className={`p-2 rounded-lg border ${theme.panelBg} ${theme.panelBorder}`}>
-              {isDarkMode ? '🌙' : '☀️'}
-          </button>
-          <button onClick={toggleFullscreen} className={`p-2 rounded-lg border ${theme.panelBg} ${theme.panelBorder}`}>
-              {isFullscreen ? '⛶' : '⛶'}
-          </button>
+      {/* 상단 컨트롤 바 */}
+      <div className="absolute top-4 left-4 z-50 flex items-center gap-3">
+         {user ? (
+             <div className="flex items-center gap-2 animate-fade-in">
+                 <span className={`px-3 py-1 rounded-full text-xs border ${theme.panelBorder} font-mono ${theme.panelBg} ${theme.subText}`}>
+                   👤 {user.name}
+                 </span>
+                 <button onClick={handleLogout} className="text-xs text-red-500 hover:underline">Logout</button>
+             </div>
+         ) : (
+             <button 
+                onClick={() => setIsLoginModalOpen(true)}
+                className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-full font-bold text-sm shadow-lg transition-transform active:scale-95 flex items-center gap-2"
+             >
+                🔑 Join Class
+             </button>
+         )}
+         {/* 교수님 모드 전환 버튼 */}
+         <button onClick={() => setIsProfessor(true)} className="text-gray-500 hover:text-white text-xs opacity-50 hover:opacity-100" title="Professor Mode">
+             🕵️‍♂️
+         </button>
       </div>
 
-      {/* 1. Visualizer */}
+      <div className="absolute top-4 right-4 flex gap-2 z-50">
+          <button onClick={() => setIsSoundOn(!isSoundOn)} className={`p-2 rounded-lg border ${isSoundOn ? 'bg-green-600/20 border-green-500 text-green-500' : 'bg-gray-500/20 border-gray-500 text-gray-500'}`}>{isSoundOn ? '🔊' : '🔇'}</button>
+          <button onClick={() => setIsDarkMode(!isDarkMode)} className={`p-2 rounded-lg border ${theme.panelBg} ${theme.panelBorder}`}>{isDarkMode ? '🌙' : '☀️'}</button>
+          <button onClick={toggleFullscreen} className={`p-2 rounded-lg border ${theme.panelBg} ${theme.panelBorder}`}>{isFullscreen ? '⛶' : '⛶'}</button>
+      </div>
+
+      {/* 1. Visualizer Panel */}
       {showVisualizer && (
           <div className={`w-full md:w-64 ${theme.panelBg} p-4 rounded-xl border ${theme.panelBorder} flex flex-col gap-4 shadow-xl animate-fade-in-left z-40 order-2 md:order-1 shrink-0 h-fit`}>
               <div className={`flex justify-between items-center border-b ${theme.panelBorder} pb-2`}>
@@ -527,13 +560,11 @@ function App() {
         </div>
         <p className={`text-xl mb-6 ${theme.subText} font-mono animate-pulse text-center`}>{status}</p>
         
-        {/* 👇 [수정] Start / Stop 토글 버튼 */}
         <button onClick={toggleSystem} className={`px-10 py-4 rounded-full font-bold text-xl text-white shadow-[0_0_20px_rgba(220,38,38,0.5)] transition-transform active:scale-95 ${isRunning.current ? 'bg-gray-700 hover:bg-gray-600' : 'bg-red-600 hover:bg-red-500'}`}>
             {isRunning.current ? '🛑 STOP & REPORT' : '👉 START KILLING'}
         </button>
 
         <div className={`mt-4 ${theme.panelBg} p-6 rounded-xl w-full max-w-sm border ${theme.panelBorder} space-y-4 shadow-xl`}>
-            {/* 설정 패널 (생략 없이) */}
             <div className="grid grid-cols-2 gap-2 text-sm pb-2"><span>Sound:</span><span className="font-bold text-yellow-500">{debugInfo.label.toUpperCase()}</span><span>Score:</span><span className="font-mono">{Math.round(debugInfo.score * 100)}%</span><span>Status:</span><span className={debugInfo.mouth.includes('Speaking') ? 'text-red-400 font-bold' : 'text-green-400'}>{debugInfo.mouth}</span></div>
             <div className={`border-t ${theme.panelBorder}`}></div>
             <div className="space-y-1"><div className="flex justify-between text-xs font-bold text-blue-400"><span>AI Confidence</span><span>{settings.confidence}%</span></div><input type="range" min="1" max="99" value={settings.confidence} onChange={(e) => handleSettingChange('confidence', parseInt(e.target.value))} className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer accent-blue-500"/></div>
@@ -552,7 +583,6 @@ function App() {
                   <button onClick={() => setShowLogs(false)} className="text-gray-400 hover:text-red-500">✕</button>
               </div>
 
-              {/* 👇 [신규] Violations 탭에 그래프 추가 */}
               {logTab === 'HISTORY' && (
                   <ViolationGraph vLogs={violationLogs} start={startTime} end={Date.now()} height="h-20" />
               )}
@@ -582,35 +612,20 @@ function App() {
           </div>
       )}
 
-      {/* 👇 [신규] 수업 종료 리포트 모달 */}
+      {/* 리포트 모달 (수업 종료 시) */}
       {showReport && reportData && (
           <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 animate-fade-in">
               <div className="bg-gray-800 border border-gray-600 rounded-2xl p-8 max-w-2xl w-full shadow-2xl relative">
                   <button onClick={() => setShowReport(false)} className="absolute top-4 right-4 text-gray-400 hover:text-white text-xl">✕</button>
-                  
                   <h2 className="text-3xl font-black text-center mb-2 text-white">MISSION DEBRIEF 📂</h2>
                   <div className="text-center text-gray-400 font-mono mb-8">{formatDuration(reportData.duration)} monitored</div>
 
-                  {/* 메인 통계 그리드 */}
                   <div className="grid grid-cols-3 gap-4 mb-8">
-                      <div className="bg-gray-700/50 p-4 rounded-xl text-center border border-gray-600">
-                          <div className="text-gray-400 text-xs uppercase font-bold mb-1">Total Kills</div>
-                          <div className="text-4xl font-black text-red-500">{reportData.totalKills}</div>
-                          <div className="text-xs text-gray-500 mt-1">Violations</div>
-                      </div>
-                      <div className="bg-gray-700/50 p-4 rounded-xl text-center border border-gray-600">
-                          <div className="text-gray-400 text-xs uppercase font-bold mb-1">Avg Recovery</div>
-                          <div className="text-4xl font-black text-orange-400">{reportData.avgRecovery}<span className="text-lg text-gray-500">s</span></div>
-                          <div className="text-xs text-gray-500 mt-1">Duration</div>
-                      </div>
-                      <div className="bg-gray-700/50 p-4 rounded-xl text-center border border-gray-600">
-                          <div className="text-gray-400 text-xs uppercase font-bold mb-1">Longest Streak</div>
-                          <div className="text-4xl font-black text-green-400">{reportData.longestStreak}<span className="text-lg text-gray-500">s</span></div>
-                          <div className="text-xs text-gray-500 mt-1">Survival</div>
-                      </div>
+                      <div className="bg-gray-700/50 p-4 rounded-xl text-center border border-gray-600"><div className="text-gray-400 text-xs uppercase font-bold mb-1">Total Kills</div><div className="text-4xl font-black text-red-500">{reportData.totalKills}</div><div className="text-xs text-gray-500 mt-1">Violations</div></div>
+                      <div className="bg-gray-700/50 p-4 rounded-xl text-center border border-gray-600"><div className="text-gray-400 text-xs uppercase font-bold mb-1">Avg Recovery</div><div className="text-4xl font-black text-orange-400">{reportData.avgRecovery}<span className="text-lg text-gray-500">s</span></div><div className="text-xs text-gray-500 mt-1">Duration</div></div>
+                      <div className="bg-gray-700/50 p-4 rounded-xl text-center border border-gray-600"><div className="text-gray-400 text-xs uppercase font-bold mb-1">Longest Streak</div><div className="text-4xl font-black text-green-400">{reportData.longestStreak}<span className="text-lg text-gray-500">s</span></div><div className="text-xs text-gray-500 mt-1">Survival</div></div>
                   </div>
 
-                  {/* 타임라인 그래프 */}
                   <div className="mb-8">
                       <h3 className="text-gray-300 font-bold mb-2 flex justify-between">
                           <span>Timeline Analysis</span>
@@ -627,7 +642,34 @@ function App() {
               </div>
           </div>
       )}
-      
+
+      {/* 로그인 모달 */}
+      {isLoginModalOpen && (
+          <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 animate-fade-in">
+              <div className={`max-w-md w-full ${theme.panelBg} border ${theme.panelBorder} p-8 rounded-2xl shadow-2xl text-center relative`}>
+                  <button onClick={() => setIsLoginModalOpen(false)} className="absolute top-4 right-4 text-gray-400 hover:text-red-500">✕</button>
+                  <h1 className={`text-3xl font-black ${theme.title} mb-2 uppercase`}>Join Class</h1>
+                  <p className={`${theme.subText} mb-6`}>Enter details to share your status.</p>
+                  
+                  <form onSubmit={handleLogin} className="space-y-4">
+                    <input 
+                      type="text" placeholder="Name (e.g. Hong Gil-dong)" 
+                      value={inputName} onChange={(e) => setInputName(e.target.value)}
+                      className={`w-full p-4 bg-transparent border ${theme.panelBorder} rounded-xl focus:border-red-500 focus:outline-none text-lg ${theme.text}`}
+                    />
+                    <input 
+                      type="text" placeholder="Student ID (e.g. 20250001)" 
+                      value={inputId} onChange={(e) => setInputId(e.target.value)}
+                      className={`w-full p-4 bg-transparent border ${theme.panelBorder} rounded-xl focus:border-red-500 focus:outline-none text-lg ${theme.text}`}
+                    />
+                    <button type="submit" className="w-full py-4 bg-red-600 hover:bg-red-500 rounded-xl font-bold text-xl text-white shadow-lg transition-transform active:scale-95 mt-2">
+                      🚀 JOIN
+                    </button>
+                  </form>
+              </div>
+          </div>
+      )}
+
       <video ref={videoRef} className="hidden" autoPlay playsInline muted></video>
     </div>
   );
