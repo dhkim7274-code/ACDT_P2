@@ -84,6 +84,10 @@ function App() {
   const animationFrameId = useRef(null);
   const intervalId = useRef(null);
 
+  // 👇 실시간 스택 및 시간 추적을 위한 Refs
+  const currentStackRef = useRef(0);
+  const lastViolationTimeRef = useRef(0);
+
   // ---------------------------------------------------------
   // 2. 핸들러 함수들 (Handlers)
   // ---------------------------------------------------------
@@ -334,13 +338,16 @@ function App() {
             setLogs([]);
             setViolationLogs([]);
             setStatus('Monitoring Active 🟢');
+            
+            // 시스템 시작 시 스택 초기화
+            currentStackRef.current = 0;
+            lastViolationTimeRef.current = 0;
 
             intervalId.current = setInterval(async () => {
                 if (!isRunning.current) return;
-                
                 const { confidence, mouthOpen, lipMovement, strictness } = settingsRef.current;
                 
-                // Vision Logic
+                // 1. Vision Logic
                 let visualState = 'No Face 🚫';
                 let isSpeakingVisual = false;
                 if (landmarkerRef.current && videoRef.current.currentTime > 0) {
@@ -363,7 +370,7 @@ function App() {
                     } else { visualizerDataRef.current.hasFace = false; }
                 }
 
-                // Audio Logic
+                // 2. Audio Logic
                 let audioLabel = 'noise';
                 let audioConfidence = 0;
                 if (classifierRef.current && audioBuffer.length >= modelSettings.current.inputSize) {
@@ -378,7 +385,7 @@ function App() {
                     } catch(e) {}
                 }
 
-                // Decision
+                // 3. 적발 여부 판단 (단일 프레임)
                 let isKoreanSuspected = 0;
                 if (isSpeakingVisual && audioLabel.toLowerCase() === 'korean' && audioConfidence > confidence) {
                     isKoreanSuspected = 1;
@@ -386,14 +393,63 @@ function App() {
 
                 if (isKoreanSuspected === 1) playWarningSound();
 
-                // 👇 파이어베이스 전송 (로그인 상태일 때만)
-                if (userRef.current) {
-                    updateStatus(userRef.current.key, isKoreanSuspected === 1, Math.round(audioConfidence * 100));
+                // -------------------------------------------------------------
+                // 👇 [동기화 핵심] 신호등 및 스택 계산 로직 (서버 전송 전 수행)
+                // -------------------------------------------------------------
+                
+                // (A) 히스토리 큐 업데이트 (신호등 색상 결정용)
+                historyQueue.current.push(isKoreanSuspected); 
+                if (historyQueue.current.length > 10) historyQueue.current.shift();
+                
+                const suspectCount = historyQueue.current.filter(v => v === 1).length;
+                
+                // (B) 신호등 색상 확정
+                let currentTrafficLight = 'GREEN';
+                if (suspectCount >= strictness) currentTrafficLight = 'RED';
+                else if (suspectCount >= 1) currentTrafficLight = 'YELLOW';
+
+                // (C) 로컬 UI 업데이트
+                setTrafficLight(currentTrafficLight);
+
+                // (D) 스택(Stack) 계산 (3초 유지 룰 적용)
+                const nowTime = Date.now();
+                let stackToSend = 0;
+
+                if (isKoreanSuspected) {
+                    // 연속 위반
+                    if (nowTime - lastViolationTimeRef.current < 3000) {
+                        currentStackRef.current += 1;
+                    } else {
+                        // 첫 위반 혹은 3초 후 재위반
+                        currentStackRef.current = 1;
+                    }
+                    lastViolationTimeRef.current = nowTime;
+                    stackToSend = currentStackRef.current;
+                } else {
+                    // 위반 아님 (침묵 등) -> 3초 룰 체크
+                    if (nowTime - lastViolationTimeRef.current < 3000) {
+                        // 3초 안 지났으면 이전 스택값 유지 (대시보드에서 사라지지 않게)
+                        stackToSend = currentStackRef.current;
+                    } else {
+                        // 3초 지났으면 초기화
+                        currentStackRef.current = 0;
+                        stackToSend = 0;
+                    }
                 }
 
-                historyQueue.current.push(isKoreanSuspected);
-                if (historyQueue.current.length > 10) historyQueue.current.shift();
+                // (E) 파이어베이스 전송 (결정된 정답지를 보냄)
+                if (userRef.current) {
+                    updateStatus(userRef.current.key, {
+                        score: Math.round(audioConfidence * 100),
+                        label: audioLabel.toLowerCase(),
+                        mouth: isSpeakingVisual ? 'Open' : 'Closed',
+                        stack: stackToSend,          // 유지된 스택 값
+                        status: currentTrafficLight  // 확정된 신호등 색상
+                    });
+                }
+                // -------------------------------------------------------------
 
+                // 로그 및 UI 업데이트
                 const now = new Date();
                 const timeString = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
                 
@@ -428,11 +484,6 @@ function App() {
                     });
                 }
 
-                const suspectCount = historyQueue.current.filter(v => v === 1).length;
-                if (suspectCount >= strictness) setTrafficLight('RED');
-                else if (suspectCount >= 1) setTrafficLight('YELLOW');
-                else setTrafficLight('GREEN');
-
                 setDebugInfo({ label: audioLabel, score: audioConfidence, mouth: visualState });
 
             }, CONFIG.INFERENCE_INTERVAL);
@@ -453,7 +504,6 @@ function App() {
       title: isDarkMode ? 'text-red-500' : 'text-red-600',
   };
 
-  // 그래프 컴포넌트
   const ViolationGraph = ({ vLogs, start, end, height = "h-16" }) => {
       const duration = end - start;
       if (duration <= 0) return null;
@@ -486,16 +536,10 @@ function App() {
       return `${h}h ${min % 60}m ${sec % 60}s`;
   };
 
-  // ---------------------------------------------------------
-  // 4. 화면 렌더링 (View)
-  // ---------------------------------------------------------
-
-  // 교수님 모드면 대시보드 렌더링
   if (isProfessor) {
       return <Dashboard onBack={() => setIsProfessor(false)} />;
   }
 
-  // 일반 학생 화면
   return (
     <div className={`min-h-screen w-screen ${theme.bg} ${theme.text} flex flex-col md:flex-row p-4 gap-4 relative overflow-hidden justify-center items-center transition-colors duration-300`}>
       
@@ -516,7 +560,6 @@ function App() {
                 🔑 Join Class
              </button>
          )}
-         {/* 교수님 모드 전환 버튼 */}
          <button onClick={() => setIsProfessor(true)} className="text-gray-500 hover:text-white text-xs opacity-50 hover:opacity-100" title="Professor Mode">
              🕵️‍♂️
          </button>
@@ -528,7 +571,6 @@ function App() {
           <button onClick={toggleFullscreen} className={`p-2 rounded-lg border ${theme.panelBg} ${theme.panelBorder}`}>{isFullscreen ? '⛶' : '⛶'}</button>
       </div>
 
-      {/* 1. Visualizer Panel */}
       {showVisualizer && (
           <div className={`w-full md:w-64 ${theme.panelBg} p-4 rounded-xl border ${theme.panelBorder} flex flex-col gap-4 shadow-xl animate-fade-in-left z-40 order-2 md:order-1 shrink-0 h-fit`}>
               <div className={`flex justify-between items-center border-b ${theme.panelBorder} pb-2`}>
@@ -552,9 +594,8 @@ function App() {
           </div>
       )}
 
-      {/* 2. Main Panel */}
       <div className="flex flex-col items-center justify-center transition-all duration-300 order-1 md:order-2 w-full max-w-2xl">
-        <h1 className={`text-4xl font-black mb-6 ${theme.title} tracking-tighter uppercase drop-shadow-[0_0_10px_rgba(239,68,68,0.5)] text-center`}>Korean Killer 🇰🇷🚫</h1>
+        <h1 className={`text-4xl font-black mb-6 ${theme.title} tracking-tighter uppercase drop-shadow-[0_0_10px_rgba(239,68,68,0.5)] text-center`}>Korean Killer</h1>
         <div className={`w-56 h-56 md:w-64 md:h-64 rounded-full border-8 ${theme.panelBorder} flex items-center justify-center mb-8 transition-all duration-300 ${trafficLight === 'RED' ? 'bg-red-600 shadow-[0_0_80px_red] animate-pulse' : trafficLight === 'YELLOW' ? 'bg-yellow-500 shadow-[0_0_40px_yellow]' : trafficLight === 'GREEN' ? 'bg-green-600 shadow-[0_0_40px_green]' : 'bg-gray-800'}`}>
           <span className="text-6xl font-bold text-white">{trafficLight}</span>
         </div>
@@ -575,7 +616,6 @@ function App() {
         </div>
       </div>
 
-      {/* 3. Logs Panel */}
       {showLogs && (
           <div className={`w-full md:w-80 ${theme.panelBg} p-4 rounded-xl border ${theme.panelBorder} flex flex-col h-64 md:h-[calc(100vh-2rem)] shadow-xl animate-fade-in-right z-40 order-3 shrink-0`}>
               <div className={`flex justify-between items-center mb-2 border-b ${theme.panelBorder} pb-2`}>
@@ -612,7 +652,6 @@ function App() {
           </div>
       )}
 
-      {/* 리포트 모달 (수업 종료 시) */}
       {showReport && reportData && (
           <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 animate-fade-in">
               <div className="bg-gray-800 border border-gray-600 rounded-2xl p-8 max-w-2xl w-full shadow-2xl relative">
@@ -643,7 +682,6 @@ function App() {
           </div>
       )}
 
-      {/* 로그인 모달 */}
       {isLoginModalOpen && (
           <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 animate-fade-in">
               <div className={`max-w-md w-full ${theme.panelBg} border ${theme.panelBorder} p-8 rounded-2xl shadow-2xl text-center relative`}>
@@ -676,3 +714,6 @@ function App() {
 }
 
 export default App;
+
+
+
